@@ -27,6 +27,10 @@ app.post('/api/schedule/calculate', (req: Request, res: Response) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Backend schedule engine running at http://localhost:${port}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(port, () => {
+    console.log(`Backend schedule engine running at http://localhost:${port}`);
+  });
+}
+
+export default app;
