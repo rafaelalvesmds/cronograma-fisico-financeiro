@@ -1,269 +1,309 @@
-import { Component, OnInit } from '@angular/core';
+import { Component, OnInit, ElementRef, ViewChild, AfterViewInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormBuilder, FormGroup, FormArray, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ScheduleService } from '../../schedule.service';
 import { ProjectScheduleResult, StepSchedule } from '../../../../models/types';
+import { Chart, registerables } from 'chart.js';
+import { debounceTime } from 'rxjs/operators';
+
+Chart.register(...registerables);
 
 @Component({
   selector: 'app-schedule-builder',
   standalone: true,
   imports: [CommonModule, ReactiveFormsModule],
   template: `
-    <div class="app-layout">
-      <!-- SIDEBAR FORM -->
-      <aside class="sidebar-setup panel">
-        <header class="panel-header">
-          <div class="icon-box">
-             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
-          </div>
-          <div>
-            <h2 class="title">Setup Projeto</h2>
-            <p class="subtitle">Configure o WBS e custos reais</p>
-          </div>
-        </header>
-
-        <form [formGroup]="projectForm" (ngSubmit)="calculateSchedule()" class="builder-form">
-          <div class="form-section">
-             <div class="form-group row-input">
-                <label>Nome do Empreendimento</label>
-                <input formControlName="name" placeholder="Ex: Torre Alpha" />
-             </div>
-             
-             <div class="grid-2-col">
-                <div class="form-group row-input">
-                   <label>Orçamento Base (R$)</label>
-                   <input formControlName="totalBudget" type="number" />
-                </div>
-                <!-- Time Unit and Total Duration inputs hidden in MVP, defaulted in background -->
-             </div>
-          </div>
-
-          <div class="form-section mt-4">
-             <div class="section-title">
-                <h3>Etapas Construtivas</h3>
-             </div>
-             
-             <div formArrayName="steps" class="steps-list custom-scrollbar">
-                <div *ngFor="let step of steps.controls; let i=index" [formGroupName]="i" class="step-card">
-                   <div class="step-header">
-                      <div class="step-badge">ID: {{ step.get('id')?.value }}</div>
-                      <button type="button" (click)="removeStep(i)" class="btn-icon danger" title="Excluir Etapa">
-                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                      </button>
-                   </div>
-                   
-                   <div class="form-group">
-                      <input formControlName="name" placeholder="Nome da Etapa" class="input-lg" />
-                   </div>
-                   
-                   <div class="grid-2-col gap-sm">
-                      <div class="form-group">
-                         <label class="text-xs">Duração (dias)</label>
-                         <input formControlName="duration" type="number" min="1" />
-                      </div>
-                      <div class="form-group">
-                         <label class="text-xs">Custo (R$)</label>
-                         <input formControlName="cost" type="number" min="0" />
-                      </div>
-                   </div>
-                   
-                   <div class="form-group deps-group">
-                      <label class="text-xs">Depende de (IDs, vírgula):</label>
-                      <input type="text" [value]="getDependenciesString(i)" (change)="updateDependencies(i, $event)" placeholder="Ex: 1, 3" />
-                   </div>
-                </div>
-             </div>
-             
-             <button type="button" (click)="addCustomStep()" class="btn-outline dashed full-width mt-3">
-               + Adicionar Nova Etapa WBS
-             </button>
-          </div>
-
-        </form>
-        <div class="sidebar-footer">
-            <button type="submit" class="btn-primary full-width lg" [disabled]="projectForm.invalid" (click)="calculateSchedule()">
-               Gerar Linha do Tempo
-               <svg style="margin-left: 8px" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
-            </button>
+    <div class="schedule-container">
+      <header class="main-header">
+        <div>
+           <h2>Setup & Acompanhamento: {{ projectForm.get('name')?.value }}</h2>
+           <p class="subtitle" *ngIf="isBaselineFrozen">Modo de Acompanhamento (Linha de Base Congelada)</p>
+           <p class="subtitle" *ngIf="!isBaselineFrozen">Modo de Planejamento Inicial</p>
         </div>
-      </aside>
+        <div class="header-actions">
+           <button type="button" class="btn-primary" (click)="toggleBaseline()">
+              {{ isBaselineFrozen ? 'Descongelar Linha de Base' : 'Congelar Linha de Base' }}
+           </button>
+        </div>
+      </header>
 
-      <!-- MAIN CONTENT: GANTT CHART -->
-      <main class="main-content">
-        <header class="topbar">
-           <h1>{{ projectForm.get('name')?.value || 'Cronograma Físico-Financeiro' }}</h1>
-           <div class="status-badge live" *ngIf="scheduleResult">Motor Agendado</div>
-        </header>
-        
-        <div class="dashboard-grid" *ngIf="scheduleResult; else emptyState">
-           
-           <!-- Metrics Row -->
-           <div class="metrics-row">
-              <div class="metric-card">
-                 <div class="icon bg-indigo-light">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-indigo"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                 </div>
-                 <div class="data">
-                    <p>Prazo Calculado</p>
-                    <h3>{{ scheduleResult.projectEndDate }} dias</h3>
-                 </div>
-              </div>
+      <div class="split-view">
+        <!-- FORMULÁRIO DE EDIÇÃO DAS ETAPAS -->
+        <form [formGroup]="projectForm" (ngSubmit)="calculateSchedule()" class="steps-form">
+          <div class="sidebar-scroll-area custom-scrollbar">
+            <div class="form-group row-input" *ngIf="!isBaselineFrozen">
+               <label>Nome do Projeto:</label>
+               <input formControlName="name" />
+            </div>
+            <div class="form-group row-input" *ngIf="!isBaselineFrozen">
+               <label>Orçamento Total Estimado (R$):</label>
+               <input formControlName="totalBudget" type="number" />
+            </div>
 
-              <div class="metric-card">
-                 <div class="icon bg-emerald-light">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-emerald"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
-                 </div>
-                 <div class="data">
-                    <p>Custo Alocado</p>
-                    <h3>{{ scheduleResult.totalCost | currency:'BRL':'R$' }}</h3>
-                 </div>
-              </div>
-
-              <div class="metric-card">
-                 <div class="icon bg-slate">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-slate"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-                 </div>
-                 <div class="data">
-                    <p>Total de Etapas</p>
-                    <h3>{{ scheduleResult.steps.length }} un.</h3>
-                 </div>
-              </div>
-           </div>
-
-           <!-- Gantt Chart Panel -->
-           <div class="panel gantt-board mt-4">
-              <div class="panel-header border-bottom">
-                 <h2 class="title">Visualização Gantt</h2>
+            <h3>Etapas Construtivas (WBS)</h3>
+            <div formArrayName="steps" class="steps-list">
+            <div *ngFor="let step of steps.controls; let i=index" [formGroupName]="i" class="step-card">
+              <div class="step-header">
+                <span class="step-badge">Etapa {{i + 1}} - {{ step.get('name')?.value || 'Nova' }}</span>
+                <button type="button" *ngIf="!isBaselineFrozen" (click)="removeStep(i)" class="btn-danger btn-sm">Excluir</button>
               </div>
               
-              <div class="gantt-container" [ngClass]="{'animate-in': animationTrigger}">
-                 <div class="gantt-row header">
-                    <div class="task-col">WBS ID / Nome da Tarefa</div>
-                    <div class="timeline-col">Linha do Tempo (Dias)
-                       <div class="scale-marks">
-                          <span>0</span>
-                          <span>{{ Math.ceil(scheduleResult.projectEndDate / 2) }}</span>
-                          <span>{{ scheduleResult.projectEndDate }}</span>
-                       </div>
-                    </div>
+              <!-- PLANNING MODE INPUTS -->
+              <div *ngIf="!isBaselineFrozen" class="step-row">
+                <input formControlName="name" placeholder="Nome" class="flex-2" />
+                <input formControlName="duration" type="number" placeholder="Duração" class="flex-1" />
+                <input formControlName="cost" type="number" placeholder="Custo R$" class="flex-1" />
+              </div>
+              
+              <!-- TRACKING MODE INPUTS -->
+              <div *ngIf="isBaselineFrozen" class="tracking-row">
+                 <div class="track-info">
+                    <small>Plan: {{step.get('duration')?.value}}d | R$ {{step.get('cost')?.value}}</small>
                  </div>
-
-                 <div *ngFor="let step of scheduleResult.steps" class="gantt-row task-row">
-                    <div class="task-col">
-                       <div class="task-title-flex">
-                          <span class="id-pill">{{ step.id }}</span>
-                          <strong>{{ step.name }}</strong>
-                       </div>
-                       <div class="task-meta">
-                          <span>{{step.duration}}d</span> • <span>{{step.cost | currency:'BRL':'R$'}}</span>
-                          <span *ngIf="isCriticalPath(step)" class="critical-indicator" title="Caminho Crítico">🔥</span>
-                       </div>
+                 <div class="track-inputs">
+                    <div class="input-col">
+                       <label>% Concluído</label>
+                       <input formControlName="progressPercentage" type="number" min="0" max="100" />
                     </div>
-                    
-                    <div class="timeline-col">
-                       <!-- Track background -->
-                       <div class="timeline-track">
-                          <div class="timeline-bar" 
-                               [ngClass]="{'critical': isCriticalPath(step)}"
-                               [style.width.%]="getBarWidth(step.duration)" 
-                               [style.left.%]="getBarMargin(step.startDate)">
-                               <span class="bar-label">{{step.startDate}} a {{step.endDate}}</span>
-                          </div>
-                       </div>
+                    <div class="input-col">
+                       <label>Início Real (Dia)</label>
+                       <input formControlName="actualStartDate" type="number" />
+                    </div>
+                    <div class="input-col full-col">
+                       <label>Custo Real (R$)</label>
+                       <input formControlName="actualCost" type="number" />
                     </div>
                  </div>
               </div>
-           </div>
-
-           <!-- S-Curve Financial Summary Panel -->
-           <div class="panel mt-4 mb-4">
-              <div class="panel-header border-bottom">
-                 <h2 class="title">Demonstrativo de Desembolso (Curva S)</h2>
-                 <p class="subtitle text-xs">Acompanhamento consolidado do custo estimado (Agrupado simplificado MVP)</p>
+              
+              <div class="deps-row mt-2" *ngIf="!isBaselineFrozen">
+                 <label class="text-xs">Depende de (IDs):</label>
+                 <input type="text" [value]="getDependenciesString(i)" (change)="updateDependencies(i, $event)" placeholder="Ex: 1, 2" />
               </div>
-              <div class="s-curve-container p-4">
-                 <div class="table-responsive">
-                    <table class="modern-table">
-                       <thead>
-                          <tr>
-                             <th>Período (Dia)</th>
-                             <th>Custo do Dia</th>
-                             <th>Custo Acumulado</th>
-                             <th>% Concluído</th>
-                          </tr>
-                       </thead>
-                       <tbody>
-                          <!-- Showing max 10 periods for the MVP UI to avoid very long tables, picking strategic points -->
-                          <tr *ngFor="let flow of getSummaryCashFlow(scheduleResult.cashFlow)">
-                             <td>Dia {{ flow.period }}</td>
-                             <td>{{ flow.periodCost | currency:'BRL':'R$' }}</td>
-                             <td class="font-bold">{{ flow.accumulatedCost | currency:'BRL':'R$' }}</td>
-                             <td>
-                                <div class="progress-wrap">
-                                   <div class="progress-bg">
-                                      <div class="progress-fill" [style.width.%]="flow.accumulatedPercentage"></div>
-                                   </div>
-                                   <span class="text-xs">{{ flow.accumulatedPercentage | number:'1.0-1' }}%</span>
-                                </div>
-                             </td>
-                          </tr>
-                       </tbody>
-                    </table>
+            </div>
+          </div>
+
+          </div>
+
+          <div class="actions">
+            <button type="button" *ngIf="!isBaselineFrozen" (click)="addCustomStep()" class="btn-secondary">+ Nova Tarefa</button>
+            <button type="submit" class="btn-primary full-width" [disabled]="projectForm.invalid">
+               Gerar Linha do Tempo
+            </button>
+          </div>
+        </form>
+
+        <!-- VISUALIZAÇÃO GANTT E RESULTADO -->
+        <div class="gantt-board" *ngIf="scheduleResult">
+          <h3>Cronograma de Execução Física</h3>
+          
+          <div class="summary-cards">
+             <div class="card">
+                <span>Prazo Original (Baseline)</span>
+                <strong>{{ scheduleResult.projectEndDate }} dias</strong>
+             </div>
+             <div class="card trend-card" [ngClass]="getTrendClass(scheduleResult.projectedEndDate, scheduleResult.projectEndDate)">
+                <span>Prazo Projetado</span>
+                <strong>{{ scheduleResult.projectedEndDate }} dias</strong>
+             </div>
+             <div class="card">
+                <span>Orçamento Base</span>
+                <strong>R$ {{ scheduleResult.totalPlannedCost | number:'1.2-2' }}</strong>
+             </div>
+             <div class="card trend-card" [ngClass]="getTrendClass(scheduleResult.totalActualCost, scheduleResult.totalPlannedCost)">
+                <span>Custo Medido/Realizado</span>
+                <strong>R$ {{ scheduleResult.totalActualCost | number:'1.2-2' }}</strong>
+             </div>
+          </div>
+
+          <!-- DUAL GANTT CHART -->
+          <div class="gantt-chart">
+            <div class="gantt-legend">
+               <span class="legend-item"><div class="box gray"></div> Baseline</span>
+               <span class="legend-item"><div class="box green"></div> Realizado</span>
+               <span class="legend-item"><div class="box red"></div> Caminho Crítico</span>
+            </div>
+            
+            <div *ngFor="let step of scheduleResult.steps" class="gantt-row">
+              <div class="step-info">
+                <strong>{{ step.name }}</strong>
+                <span class="status-badge" [ngClass]="getStatusClass(step.status)">{{ step.status }}</span>
+              </div>
+              
+              <div class="time-track-container">
+                 <!-- Baseline Bar (Background/Gray) -->
+                 <div class="timeline-bar baseline-bar" 
+                      [style.width.%]="getBarWidth(step.duration)" 
+                      [style.left.%]="getBarMargin(step.startDate)">
+                 </div>
+                 
+                 <!-- Actual/Projected Bar (Foreground) -->
+                 <div class="timeline-bar actual-bar" 
+                      [ngClass]="{'critical': step.isCritical, 'frozen': isBaselineFrozen}"
+                      [style.width.%]="getBarWidth(step.projectedEndDate - step.projectedStartDate)" 
+                      [style.left.%]="getBarMargin(step.projectedStartDate)">
+                      <!-- Progress Fill inside Actual Bar -->
+                      <div class="progress-fill" [style.width.%]="step.progressPercentage || 0"></div>
                  </div>
               </div>
-           </div>
-
+            </div>
+          </div>
+          
+          <!-- S-CURVE FINANCIAL CHART -->
+          <div class="s-curve-section mt-4">
+             <h3>Dashboard Físico-Financeiro (Curva S)</h3>
+             <div class="chart-container">
+                <canvas #sCurveCanvas></canvas>
+             </div>
+          </div>
+          
         </div>
-
-        <ng-template #emptyState>
-           <div class="empty-state">
-              <div class="illustration">
-                 <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-              </div>
-              <h3>Pronto para planejar</h3>
-              <p>Configure as etapas WBS no painel lateral e clique em <b>Gerar Linha do Tempo</b> para visualizar o Gráfico de Gantt e a Curva S Financeira do seu projeto.</p>
-           </div>
-        </ng-template>
-
-      </main>
+      </div>
     </div>
   `,
-  styleUrls: ['./schedule-builder.component.css']
+  styles: [`
+    .schedule-container { padding: 1.5rem 2rem; font-family: 'Inter', sans-serif; background: #f8fafc; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    .main-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; background: #fff; padding: 1.25rem 1.5rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); flex-shrink: 0; border: 1px solid #e2e8f0; }
+    .main-header h2 { margin: 0; color: #0f172a; font-size: 1.25rem; font-weight: 700; letter-spacing: -0.025em; }
+    .subtitle { color: #64748b; font-size: 0.85rem; margin-top: 4px; font-weight: 500;}
+    
+    .split-view { display: flex; gap: 1.5rem; align-items: stretch; flex: 1; overflow: hidden; min-height: 0; }
+    @media (max-width: 1024px) { .split-view { flex-direction: column; overflow-y: auto; } }
+    
+    .steps-form { width: 420px; min-width: 420px; display: flex; flex-direction: column; background: #fff; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); height: 100%; border: 1px solid #e2e8f0; }
+    .sidebar-scroll-area { flex: 1; overflow-y: auto; padding-right: 8px; display: flex; flex-direction: column; gap: 1rem; margin-bottom: 0.5rem; }
+    .form-group.row-input { display: flex; flex-direction: column; gap: 0.4rem; }
+    .form-group label { font-size: 0.85rem; font-weight: 600; color: #475569; }
+    input { padding: 0.6rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; background: #f8fafc; transition: all 0.2s; }
+    input:focus { outline: none; border-color: #4f46e5; background: #fff; box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1); }
+    input.flex-2 { flex: 2; width: 100%; } input.flex-1 { flex: 1; width: 100%; }
+    
+    .steps-list { display: flex; flex-direction: column; gap: 1rem; margin-bottom: 1rem; }
+    .step-card { border: 1px solid #e2e8f0; padding: 1rem; border-radius: 8px; background: #ffffff; transition: box-shadow 0.2s; }
+    .step-card:hover { box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border-color: #cbd5e1; }
+    .step-header { display: flex; justify-content: space-between; margin-bottom: 0.75rem; align-items: center; }
+    .step-badge { font-size: 0.75rem; background: #f1f5f9; color: #475569; padding: 4px 8px; border-radius: 12px; font-weight: 700; border: 1px dashed #cbd5e1; }
+    .step-row { display: flex; gap: 0.5rem; }
+    
+    .tracking-row { display: flex; flex-direction: column; gap: 0.5rem; }
+    .track-info small { color: #64748b; font-weight: 600; }
+    .track-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-top: 0.5rem; }
+    .track-inputs .full-col { grid-column: span 2; }
+    .input-col { display: flex; flex-direction: column; gap: 0.2rem; }
+    .input-col label { font-size: 0.7rem; color: #64748b; font-weight: 600; }
+    
+    .deps-row { display: flex; flex-direction: column; gap: 0.2rem; }
+    .text-xs { font-size: 0.75rem; color: #64748b; font-weight: 600; }
+    .mt-2 { margin-top: 0.5rem; }
+    .mt-4 { margin-top: 2rem; }
+    
+    .actions { display: flex; flex-direction: column; gap: 0.75rem; padding-top: 1rem; border-top: 1px solid #e2e8f0; flex-shrink: 0; }
+    button { padding: 0.75rem 1rem; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; display: flex; justify-content: center; align-items: center;}
+    .full-width { width: 100%; }
+    .btn-primary { background: #4f46e5; color: white; box-shadow: 0 2px 4px rgba(79, 70, 229, 0.3); }
+    .btn-primary:hover:not(:disabled) { background: #4338ca; transform: translateY(-1px); }
+    .btn-primary:disabled { background: #a5b4fc; cursor: not-allowed; box-shadow: none; }
+    .btn-secondary { background: #f1f5f9; color: #475569; border: 1px dashed #cbd5e1;}
+    .btn-secondary:hover { background: #e2e8f0; color: #1e293b; border-color: #94a3b8; }
+    .btn-danger { background: #fee2e2; color: #ef4444; }
+    .btn-danger:hover { background: #fecaca; color: #dc2626; }
+    .btn-sm { padding: 0.25rem 0.6rem; font-size: 0.75rem; border-radius: 6px; }
+
+    /* Gantt Board Area */
+    .gantt-board { flex: 1; min-width: 0; background: #fff; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); border: 1px solid #e2e8f0; overflow-y: auto; display: flex; flex-direction: column; }
+    .gantt-board h3 { margin-top: 0; color: #0f172a; border-bottom: 2px solid #f1f5f9; padding-bottom: 1rem; margin-bottom: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
+    
+    .summary-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; flex-shrink: 0; }
+    .card { background: #fff; padding: 1.25rem; border-radius: 10px; border: 1px solid #e2e8f0; display: flex; flex-direction: column; box-shadow: 0 1px 3px rgba(0,0,0,0.02); }
+    .card span { font-size: 0.75rem; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card strong { font-size: 1.25rem; color: #0f172a; margin-top: 0.5rem; }
+    .trend-card.bad { border-color: #fecaca; background: #fff5f5; }
+    .trend-card.bad strong { color: #e11d48; }
+    .trend-card.good { border-color: #a7f3d0; background: #f0fdf4; }
+    .trend-card.good strong { color: #059669; }
+
+    /* Custom Scrollbar */
+    .custom-scrollbar::-webkit-scrollbar, .gantt-board::-webkit-scrollbar { width: 6px; height: 6px; }
+    .custom-scrollbar::-webkit-scrollbar-track, .gantt-board::-webkit-scrollbar-track { background: transparent; }
+    .custom-scrollbar::-webkit-scrollbar-thumb, .gantt-board::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover, .gantt-board::-webkit-scrollbar-thumb:hover { background-color: #94a3b8; }
+
+    /* Dual Gantt implementation */
+    .gantt-chart { margin-top: 1rem; display: flex; flex-direction: column; gap: 1.25rem; }
+    .gantt-legend { display: flex; gap: 1rem; font-size: 0.8rem; color: #64748b; margin-bottom: 1rem; font-weight: 500;}
+    .legend-item { display: flex; align-items: center; gap: 6px; }
+    .box { width: 12px; height: 12px; border-radius: 3px; }
+    .box.gray { background: #e2e8f0; }
+    .box.green { background: #10b981; }
+    .box.red { background: #ef4444; }
+
+    .gantt-row { display: flex; align-items: center; gap: 15px; }
+    .step-info { width: 180px; min-width: 180px; display: flex; flex-direction: column; gap: 4px; padding-right: 15px; border-right: 2px solid #f1f5f9; }
+    .step-info strong { font-size: 0.85rem; color: #1e293b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    
+    .status-badge { font-size: 0.65rem; padding: 2px 6px; border-radius: 8px; font-weight: 700; display: inline-block; width: fit-content; }
+    .status-badge.on-track { background: #dbeafe; color: #2563eb; }
+    .status-badge.in-progress { background: #fef3c7; color: #d97706; }
+    .status-badge.delayed { background: #fee2e2; color: #dc2626; }
+    .status-badge.over-budget { background: #ffedd5; color: #ea580c; }
+    .status-badge.completed { background: #d1fae5; color: #059669; }
+    .status-badge.not-started { background: #f1f5f9; color: #64748b; }
+
+    .time-track-container { flex: 1; position: relative; height: 36px; background: repeating-linear-gradient(90deg, transparent, transparent 19.8%, #f8fafc 19.8%, #f8fafc 20%); border-radius: 8px; }
+    
+    .timeline-bar { position: absolute; border-radius: 6px; height: 14px; transition: all 0.4s ease-out; }
+    
+    .baseline-bar { top: 4px; background: #e2e8f0; z-index: 1; border: 1px dashed #cbd5e1; }
+    
+    .actual-bar { top: 18px; background: #f1f5f9; border: 1px solid #cbd5e1; z-index: 2; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .actual-bar.frozen { background: #e2e8f0; border-color: #94a3b8; } /* Looks clickable/different when tracking */
+    .actual-bar .progress-fill { height: 100%; background: linear-gradient(90deg, #10b981, #059669); transition: width 0.4s ease-out; }
+    .actual-bar.critical { border: 2px solid #ef4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+    .actual-bar.critical.frozen { border-color: #ef4444; }
+
+    /* Chart Area */
+    .s-curve-section { border-top: 2px solid #f1f5f9; padding-top: 1.5rem; }
+    .chart-container { height: 350px; width: 100%; margin-top: 1rem; position: relative; }
+  `]
 })
 export class ScheduleBuilderComponent implements OnInit {
   projectForm!: FormGroup;
   scheduleResult: ProjectScheduleResult | null = null;
-  Math = Math;
-  animationTrigger = false;
+  isBaselineFrozen = false;
+  
+  @ViewChild('sCurveCanvas') sCurveCanvas!: ElementRef<HTMLCanvasElement>;
+  chartInstance: Chart | null = null;
 
   constructor(private fb: FormBuilder, private scheduleSvc: ScheduleService) {}
 
   ngOnInit() {
     this.projectForm = this.fb.group({
-      name: ['Residencial Alpha', Validators.required],
+      name: ['Residencial Alpha Tracking', Validators.required],
       totalDurationUsable: [180],
       timeUnit: ['days'],
       totalBudget: [150000],
+      isBaselineFrozen: [false],
       steps: this.fb.array([])
+    });
+
+    this.projectForm.valueChanges.pipe(debounceTime(600)).subscribe(() => {
+       // Only auto-recalculate if baseline is frozen (tracking mode)
+       if (this.isBaselineFrozen) {
+          this.calculateSchedule();
+       }
     });
 
     this.loadDefaultTemplate();
   }
 
-  get steps() {
-    return this.projectForm.get('steps') as FormArray;
-  }
+  get steps() { return this.projectForm.get('steps') as FormArray; }
 
   loadDefaultTemplate() {
     const defaults = [
       { id: '1', name: 'Serviços Preliminares', duration: 10, cost: 5000, dependencies: [] },
       { id: '2', name: 'Fundação', duration: 20, cost: 35000, dependencies: [{ stepId: '1', type: 'FS' }] },
       { id: '3', name: 'Superestrutura', duration: 30, cost: 50000, dependencies: [{ stepId: '2', type: 'FS' }] },
-      { id: '4', name: 'Cobertura', duration: 15, cost: 20000, dependencies: [{ stepId: '3', type: 'FS' }] },
-      { id: '5', name: 'Alvenaria', duration: 15, cost: 15000, dependencies: [{ stepId: '3', type: 'FS' }] },
-      { id: '6', name: 'Instalação Elétrica', duration: 20, cost: 15000, dependencies: [{ stepId: '5', type: 'FS' }] },
-      { id: '7', name: 'Instalação Hidráulica', duration: 20, cost: 10000, dependencies: [{ stepId: '5', type: 'FS' }] },
-      { id: '8', name: 'Acabamento', duration: 30, cost: 15000, dependencies: [{ stepId: '4', type: 'FS' }, { stepId: '6', type: 'FS' }, { stepId: '7', type: 'FS' }] }
+      { id: '4', name: 'Acabamento', duration: 20, cost: 15000, dependencies: [{ stepId: '3', type: 'FS' }] }
     ];
 
     defaults.forEach(item => {
@@ -272,23 +312,38 @@ export class ScheduleBuilderComponent implements OnInit {
         name: [item.name, Validators.required],
         duration: [item.duration, Validators.required],
         cost: [item.cost],
-        dependencies: [item.dependencies]
+        dependencies: [item.dependencies],
+        // Tracking Fields
+        progressPercentage: [0], // fixed from string
+        actualStartDate: [null],
+        actualCost: [null]
       }));
     });
   }
 
   addCustomStep() {
     this.steps.push(this.fb.group({
-      id: [Math.floor(Math.random() * 900) + 100 + ''],
+      id: [Math.random().toString(36).substring(7)],
       name: ['', Validators.required],
       duration: [1],
       cost: [0],
-      dependencies: [[]]
+      dependencies: [[]],
+      progressPercentage: [0],
+      actualStartDate: [null],
+      actualCost: [null]
     }));
   }
 
-  removeStep(index: number) {
-    this.steps.removeAt(index);
+  removeStep(index: number) { this.steps.removeAt(index); }
+
+  toggleBaseline() {
+    this.isBaselineFrozen = !this.isBaselineFrozen;
+    this.projectForm.get('isBaselineFrozen')?.setValue(this.isBaselineFrozen);
+    
+    // Automatically recalculate to show tracking layout impacts
+    if (this.isBaselineFrozen) {
+       this.calculateSchedule();
+    }
   }
 
   getDependenciesString(index: number): string {
@@ -300,8 +355,7 @@ export class ScheduleBuilderComponent implements OnInit {
   updateDependencies(index: number, event: any) {
     const value = event.target.value;
     if (!value.trim()) {
-       this.steps.at(index).get('dependencies')?.setValue([]);
-       return;
+       this.steps.at(index).get('dependencies')?.setValue([]); return;
     }
     const depsIds = value.split(',').map((s: string) => s.trim()).filter((s: string) => s);
     const depsArray = depsIds.map((id: string) => ({ stepId: id, type: 'FS' }));
@@ -312,53 +366,138 @@ export class ScheduleBuilderComponent implements OnInit {
     if (this.projectForm.invalid) return;
     const projectData = this.projectForm.value;
     
-    this.animationTrigger = false;
     this.scheduleSvc.calculateSchedule(projectData).subscribe({
       next: (res) => {
         this.scheduleResult = res;
-        setTimeout(() => this.animationTrigger = true, 50);
+        setTimeout(() => {
+           this.renderChart();
+        }, 100);
       },
       error: (err) => {
         console.error('Error calculating schedule:', err);
-        alert('Erro ao calcular cronograma: verifique se há dependências cíclicas (loop).');
+        alert('Erro ao calcular cronograma: verifique dependências.');
       }
     });
   }
 
+  // --- UI Helpers ---
   getBarWidth(duration: number): number {
-    if (!this.scheduleResult || this.scheduleResult.projectEndDate === 0) return 0;
-    return (duration / this.scheduleResult.projectEndDate) * 100;
+    if (!this.scheduleResult || this.scheduleResult.projectedEndDate === 0) return 0;
+    const maxEnd = Math.max(this.scheduleResult.projectEndDate, this.scheduleResult.projectedEndDate);
+    return (duration / maxEnd) * 100;
   }
 
   getBarMargin(startDate: number): number {
-    if (!this.scheduleResult || this.scheduleResult.projectEndDate === 0) return 0;
-    return (startDate / this.scheduleResult.projectEndDate) * 100;
+    if (!this.scheduleResult || this.scheduleResult.projectedEndDate === 0) return 0;
+    const maxEnd = Math.max(this.scheduleResult.projectEndDate, this.scheduleResult.projectedEndDate);
+    if (startDate === undefined || startDate === null) return 0;
+    return (startDate / maxEnd) * 100;
   }
 
-  // Simplified Critical Path check for MVP: Any task that ends exactly when the project ends,
-  // or takes up significant portion sequentially
-  isCriticalPath(step: StepSchedule): boolean {
-    if (!this.scheduleResult) return false;
-    // Real logic via CPM would trace parents backwards. MVP Logic:
-    return step.endDate === this.scheduleResult.projectEndDate;
+  getTrendClass(actual: number, planned: number): string {
+     if (actual > planned) return 'bad';
+     if (actual <= planned && actual > 0) return 'good';
+     return '';
   }
 
-  // Condense the daily cash flow into meaningful steps for the UI table
-  getSummaryCashFlow(flow: any[]): any[] {
-     if (!flow || flow.length === 0) return [];
-     if (flow.length <= 10) return flow;
+  getStatusClass(status: string): string {
+     return status.toLowerCase().replace(' ', '-');
+  }
+
+  // --- Chart.js Integration ---
+  renderChart() {
+     if (!this.scheduleResult || !this.sCurveCanvas) return;
      
-     // Take roughly 10 snapshots equally sparse (10%, 20%, ... 100%)
-     const stepSize = Math.max(1, Math.floor(flow.length / 10));
-     const result = [];
-     for(let i = stepSize - 1; i < flow.length; i += stepSize) {
-        result.push(flow[i]);
+     if (this.chartInstance) {
+        this.chartInstance.destroy();
      }
-     
-     // Ensure last element is always included
-     if (result[result.length - 1].period !== flow[flow.length - 1].period) {
-        result.push(flow[flow.length - 1]);
-     }
-     return result;
+
+     const ctx = this.sCurveCanvas.nativeElement.getContext('2d');
+     if (!ctx) return;
+
+     const labels = this.scheduleResult.cashFlow.map(c => 'Dia ' + c.period);
+     const plannedData = this.scheduleResult.cashFlow.map(c => c.plannedAccumulatedCost);
+     const actualData = this.scheduleResult.cashFlow.map(c => c.actualAccumulatedCost);
+
+     // Truncate actual data up to the last day with progress to show the "line stopping" effectively
+     // For MVP we just plot all. It stays flat if no more progress.
+
+     this.chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+           labels: labels,
+           datasets: [
+              {
+                 label: 'Custo Planejado Acumulado (Baseline)',
+                 data: plannedData,
+                 borderColor: '#94a3b8',
+                 backgroundColor: 'rgba(148, 163, 184, 0.1)',
+                 borderWidth: 2,
+                 fill: true,
+                 borderDash: [5, 5], // Dashed line to indicate planned
+                 tension: 0.3,
+                 pointRadius: 0
+              },
+              {
+                 label: 'Custo Realizado/Agregado Acumulado',
+                 data: actualData,
+                 borderColor: '#2563eb', // Indigo brand color
+                 backgroundColor: 'rgba(37, 99, 235, 0.15)',
+                 borderWidth: 3,
+                 fill: true,
+                 tension: 0.3,
+                 pointRadius: 2,
+                 pointBackgroundColor: '#2563eb'
+              }
+           ]
+        },
+        options: {
+           responsive: true,
+           maintainAspectRatio: false,
+           animation: false,
+           interaction: {
+              mode: 'index',
+              intersect: false,
+           },
+           plugins: {
+              legend: {
+                 position: 'top',
+                 labels: { font: { family: 'Inter', size: 12 } }
+              },
+              tooltip: {
+                 backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                 titleFont: { family: 'Inter', size: 13 },
+                 bodyFont: { family: 'Inter', size: 13 },
+                 padding: 10,
+                 callbacks: {
+                    label: function(context) {
+                       let label = context.dataset.label || '';
+                       if (label) { label += ': '; }
+                       if (context.parsed.y !== null) {
+                          label += new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(context.parsed.y);
+                       }
+                       return label;
+                    }
+                 }
+              }
+           },
+           scales: {
+              y: {
+                 beginAtZero: true,
+                 grid: { color: '#f1f5f9' },
+                 ticks: {
+                    font: { family: 'Inter', size: 11 },
+                    callback: function(value) {
+                       return 'R$ ' + value; 
+                    }
+                 }
+              },
+              x: {
+                 grid: { display: false },
+                 ticks: { font: { family: 'Inter', size: 11 }, maxTicksLimit: 15 }
+              }
+           }
+        }
+     });
   }
 }

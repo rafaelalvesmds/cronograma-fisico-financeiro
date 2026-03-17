@@ -3,62 +3,154 @@ import { ProjectInput, ProjectScheduleResult, StepInput, StepSchedule, CashFlowP
 export class ScheduleService {
   
   public calculateSchedule(project: ProjectInput): ProjectScheduleResult {
-    const stepsMap = new Map<string, StepInput>();
-    project.steps.forEach(step => stepsMap.set(step.id, step));
-
     // 1. Resolve Execution Order (Topological Sort)
     const sortedSteps = this.topologicalSort(project.steps);
 
+    // Track state
     const scheduleMap = new Map<string, StepSchedule>();
     let projectEndDate = 0;
-    let totalCost = 0;
+    let projectedProjectEndDate = 0;
+    let totalPlannedCost = 0;
+    let totalActualCost = 0;
 
-    // 2. Calculate Start and End Dates based on 'Finish-to-Start'
+    // 2. FORWARD PASS (Early Start / Early Finish) & Actual Dates
     for (const step of sortedSteps) {
-      let startDate = 0;
-
+      let earlyStart = 0;
+      let projectedStartDate = 0;
+      
+      // Calculate start dates based on predecessors
       if (step.dependencies && step.dependencies.length > 0) {
         step.dependencies.forEach(dep => {
           const parentSchedule = scheduleMap.get(dep.stepId);
-          if (parentSchedule && parentSchedule.endDate > startDate) {
-            startDate = parentSchedule.endDate; // Starts after latest dependencies ends
+          if (parentSchedule) {
+            earlyStart = Math.max(earlyStart, parentSchedule.earlyFinish);
+            projectedStartDate = Math.max(projectedStartDate, parentSchedule.projectedEndDate);
           }
         });
       }
 
-      const endDate = startDate + step.duration;
+      const duration = Number(step.duration || 0);
+      const cost = Number(step.cost || 0);
       
+      const earlyFinish = earlyStart + duration;
+      
+      // Actual dates computation (Tracking)
+      const actStart: any = step.actualStartDate;
+      const actualStart = actStart !== undefined && actStart !== null && actStart !== '' && Number(actStart) > 0 ? Number(actStart) : projectedStartDate;
+      const progress = Number(step.progressPercentage || 0);
+      
+      let actualEnd = actualStart + duration;
+      const actEnd: any = step.actualEndDate;
+      if (actEnd !== undefined && actEnd !== null && actEnd !== '' && Number(actEnd) > 0 && progress === 100) {
+         actualEnd = Number(actEnd);
+      }
+
+      // Cost tracking
+      const actCost: any = step.actualCost;
+      const earnedCost = actCost !== undefined && actCost !== null && actCost !== '' ? Number(actCost) : (cost * (progress / 100));
+
       const scheduledStep: StepSchedule = {
         ...step,
-        startDate,
-        endDate
+        startDate: earlyStart,
+        endDate: earlyFinish,
+        projectedStartDate: actualStart,
+        projectedEndDate: actualEnd,
+        earlyStart,
+        earlyFinish,
+        lateStart: 0, // calculated in backward pass
+        lateFinish: 0,
+        totalFloat: 0,
+        isCritical: false,
+        status: this.determineStatus(actualStart, actualEnd, earlyStart, earlyFinish, progress, earnedCost, step.cost)
       };
 
       scheduleMap.set(step.id, scheduledStep);
-      projectEndDate = Math.max(projectEndDate, endDate);
-      totalCost += Number(step.cost);
+      projectEndDate = Math.max(projectEndDate, earlyFinish);
+      projectedProjectEndDate = Math.max(projectedProjectEndDate, actualEnd);
+      totalPlannedCost += cost;
+      totalActualCost += earnedCost;
     }
 
-    // 3. Compute Cash Flow (S-Curve)
-    const cashFlow: CashFlowPeriod[] = [];
-    let accumulatedCost = 0;
+    // 3. BACKWARD PASS (Late Start / Late Finish & Critical Path)
+    // Initialize lateFinish for all nodes. Nodes with no successors have lateFinish = projectEndDate
+    const sortedReversed = [...sortedSteps].reverse();
+    
+    // Quick map to find all successors of a node
+    const successorsMap = new Map<string, string[]>();
+    for (const step of sortedSteps) {
+      if (!successorsMap.has(step.id)) successorsMap.set(step.id, []);
+      if (step.dependencies) {
+         step.dependencies.forEach(d => {
+            const list = successorsMap.get(d.stepId) || [];
+            list.push(step.id);
+            successorsMap.set(d.stepId, list);
+         });
+      }
+    }
 
-    for (let period = 1; period <= projectEndDate; period++) {
-      let periodCost = 0;
+    for (const step of sortedReversed) {
+      const scheduledStep = scheduleMap.get(step.id)!;
+      const successors = successorsMap.get(step.id) || [];
+      
+      let lateFinish = projectEndDate; // Default if no successors
+      if (successors.length > 0) {
+        let minSuccessorLateStart = Infinity;
+        successors.forEach(succId => {
+          const succ = scheduleMap.get(succId)!;
+          if (succ.lateStart < minSuccessorLateStart) {
+             minSuccessorLateStart = succ.lateStart;
+          }
+        });
+        lateFinish = minSuccessorLateStart;
+      }
+
+      scheduledStep.lateFinish = lateFinish;
+      scheduledStep.lateStart = lateFinish - Number(scheduledStep.duration || 0);
+      scheduledStep.totalFloat = scheduledStep.lateStart - scheduledStep.earlyStart;
+      scheduledStep.isCritical = scheduledStep.totalFloat === 0;
+    }
+
+    // 4. Compute Cash Flow (S-Curve)
+    const cashFlow: CashFlowPeriod[] = [];
+    let plannedAccumulated = 0;
+    let actualAccumulated = 0;
+    
+    const absoluteEnd = Math.max(projectEndDate, projectedProjectEndDate);
+
+    for (let period = 1; period <= absoluteEnd; period++) {
+      let plannedPeriodCost = 0;
+      let actualPeriodCost = 0;
 
       Array.from(scheduleMap.values()).forEach(step => {
+        // PLANNED distribution
         if (period > step.startDate && period <= step.endDate) {
-          const dailyCost = step.cost / step.duration;
-          periodCost += dailyCost;
+          plannedPeriodCost += Number(step.cost || 0) / Number(step.duration || 1);
+        }
+        
+        // ACTUAL/EARNED distribution
+        // Distribute the earned cost over the duration it took (or is currently taking)
+        let projDuration = step.projectedEndDate - step.projectedStartDate;
+        if (projDuration === 0) projDuration = 1; // prevent division by zero for 0-day milestones
+
+        if (period > step.projectedStartDate && period <= step.projectedEndDate) {
+           const stepEarnedCost = step.actualCost !== undefined && step.actualCost !== null 
+                                  ? step.actualCost 
+                                  : (step.cost * ((step.progressPercentage || 0) / 100));
+           actualPeriodCost += stepEarnedCost / projDuration;
         }
       });
 
-      accumulatedCost += periodCost;
+      plannedAccumulated += plannedPeriodCost;
+      actualAccumulated += actualPeriodCost;
+      
       cashFlow.push({
         period,
-        periodCost,
-        accumulatedCost,
-        accumulatedPercentage: project.totalBudget > 0 ? (accumulatedCost / project.totalBudget) * 100 : 0
+        plannedPeriodCost,
+        plannedAccumulatedCost: plannedAccumulated,
+        plannedAccumulatedPercentage: project.totalBudget > 0 ? (plannedAccumulated / project.totalBudget) * 100 : 0,
+        actualPeriodCost,
+        actualAccumulatedCost: actualAccumulated,
+        actualAccumulatedPercentage: project.totalBudget > 0 ? (actualAccumulated / project.totalBudget) * 100 : 0
       });
     }
 
@@ -66,16 +158,38 @@ export class ScheduleService {
       projectName: project.name,
       projectStartDate: 0,
       projectEndDate,
-      totalCost,
+      projectedEndDate: projectedProjectEndDate,
+      totalPlannedCost,
+      totalActualCost,
       steps: Array.from(scheduleMap.values()),
       cashFlow
     };
   }
 
+  private determineStatus(actualStart: number, actualEnd: number, pStart: number, pEnd: number, progress: number, actualCost: number, plannedCost: number): StepSchedule['status'] {
+     if (progress === 100) return 'Completed';
+     
+     // Only consider it 'Delayed' IF the current day (or actualStart) has passed the planned start AND no progress exists, 
+     // OR if it's in progress but actual end > planned end. 
+     // For a true system we'd need a "Current Date" tracking line. For now, rely on actuals.
+     
+     if (progress > 0) {
+        if (actualCost > plannedCost) return 'Over Budget';
+        if (actualEnd > pEnd) return 'Delayed';
+        return 'In Progress';
+     }
+     
+     // If no progress, but the user explicitly set an actual start date that is greater than planned start
+     if (actualStart > pStart && actualStart !== 0) return 'Delayed';
+     
+     return 'Not Started';
+     // Simplify to "On Track" within frontend if neither delayed nor over budget
+  }
+
   private topologicalSort(steps: StepInput[]): StepInput[] {
     const sorted: StepInput[] = [];
     const visited = new Set<string>();
-    const processing = new Set<string>(); // to detect true cycles if needed
+    const processing = new Set<string>();
     
     const visit = (stepId: string) => {
       if (visited.has(stepId)) return;
